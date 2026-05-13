@@ -48,7 +48,10 @@ def main() -> None:
             logger.info("Local tensor mode enabled - skipping training execution")
             return
 
-        trainer = config.build()  # pyrefly: ignore [missing-attribute]
+        # pyrefly: ignore [missing-attribute]
+        # 调用Configurable.Config 的build 方法，得到Trainer 实例（）
+        # 相当于调用 trainer = Trainer(config==dataclasses.replace(config))
+        trainer = config.build()
 
         if (
             config.checkpoint.create_seed_checkpoint  # pyrefly: ignore[missing-attribute]

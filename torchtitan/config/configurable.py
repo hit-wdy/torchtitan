@@ -41,8 +41,13 @@ class Configurable:
     class Config:
         """Base config class for all configurable components."""
 
+        # 加上 ClassVar 表示：不属于某个 Config() 实例，而是挂在 Config 这个类本身上，全体实例共用同一个值
+        # 在 Configurable 的子类定义完成时，__init_subclass__ 里执行：config_cls._owner = cls   
+        # cls 就是外层子类，例如 HuggingFaceTokenizer
+        # 所以不是手写赋值，而是例如： class HuggingFaceTokenizer(Configurable): class Config: ... 定义完那一刻自动贴上的。
         _owner: ClassVar[type | None] = None
 
+        # 把 当前这份 config 变成 普通 dict，方便日志、写 JSON。
         def to_dict(self) -> dict:
             """Serialize config to a plain dict (recursing into nested configs)."""
 
@@ -131,6 +136,8 @@ class Configurable:
                 elif hasattr(val, "traverse"):
                     yield from _traverse_child(val, fqn, self, f.name)
 
+
+        # 根据 config 构造出 真正的运行对象（_owner 是类本身）
         def build(self, **kwargs):
             """Construct the owning class. Auto-wired by __init_subclass__.
 
@@ -159,6 +166,7 @@ class Configurable:
                     )
                 return self._owner(config=replace(self), **kwargs)
 
+    # 校验 slots + kw_only，并设置 Config._owner = 子类
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
         if "Config" in cls.__dict__:

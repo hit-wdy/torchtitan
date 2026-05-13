@@ -57,6 +57,8 @@ from torchtitan.tools.profiler import Profiler
 
 
 class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
+    # kw_only=True：构造时只能用关键字参数，不能用位置参数
+    # slots=True：优化内存使用，禁止创建 __dict__ 字典
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
         """
@@ -195,6 +197,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     parallel_dims: ParallelDims
 
     # swappable training components
+    # 注意：这里名字和上面config一样，但Trainer.Config 管「参数/配方」，Trainer 管「已经建好的运行对象」。
     tokenizer: BaseTokenizer
     dataloader: BaseDataLoader
     model_config: BaseModel.Config
@@ -231,13 +234,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         ), "model_spec must be set before creating Trainer"
         model_spec = config.model_spec
 
+        # 在每个训练进程里选定「本进程用哪张加速卡 / 哪个设备」，并让当前进程默认就在该设备上工作
+        # device_module：对应的 模块对象，例如 torch.cuda
         device_module, device_type = utils.device_module, utils.device_type
         # pyrefly: ignore [read-only]
         self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
         # Device has to be set before creating TorchFT manager.
+        # 把当前进程的默认设备设成 self.device，例如 CUDA：0
         device_module.set_device(self.device)
 
         # init distributed and build meshes
+        # 初始化分布式训练，建立各种并行维度（DP、TP、PP 等）的 Mesh，例如：
+        # parallel_dims = ParallelDims(dp_shard=1, dp_replicate=1, tp=1, pp=1, ep=1, etp=1, world_size=8)
         self.parallel_dims = parallel_dims = self.init_distributed()
 
         # validate dense activation sequence length evenness
@@ -279,8 +287,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         )
 
         # build model (using meta init)
+        # model_spec.model 是 ModelSpec 里的 model 字段，即 BaseModel.Config
+        # 也就是某个 BaseModel.Config 子类的实例（层数、hidden、MoE 等模型结构超参），不是权重、也不是 nn.Module。
         model_config = model_spec.model
-        # set the model args from training job configs
+        # 依据每个模型各自的 Config 子类，实现 update_from_config 方法，来更新模型结构超参
         model_config.update_from_config(
             config=config,
         )
@@ -300,6 +310,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             torch.device("meta"),
             utils.set_default_dtype(TORCH_DTYPE_MAP[config.training.dtype]),
         ):
+            # 调用 model_config.build() 构造出真正的模型对象，例如：DeepSeekV3Model(config=model_config)
+            # 进一步调用其父类 Decoder() 构造模型对象（包含 tok_embeddings、rope、layers、norm、output 等子模块）
             model = model_config.build()
 
         # Verify all submodules satisfy the Module protocol
