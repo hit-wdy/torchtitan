@@ -62,6 +62,27 @@ class LocalMapConfig:
         return {"repr": repr(self)}
 
 
+# 可以把一个模块的 forward 抽象成：
+# 参数/Buffer
+#     │ state_shardings
+#     ▼
+# 输入的原始布局
+#     │ in_src_shardings
+#     ▼
+# 输入重新分布
+#     │ in_dst_shardings
+#     ▼
+# 可选 local_map：DTensor → 本地 Tensor
+#     ▼
+# 真正的 module.forward()
+#     ▼
+# 模块计算刚产生的输出布局
+#     │ out_src_shardings
+#     ▼
+# 输出重新分布
+#     │ out_dst_shardings
+#     ▼
+# 交给下游模块
 @dataclass(kw_only=True, slots=True)
 class ShardingConfig:
     """Declarative sharding for a Module's states and activations.

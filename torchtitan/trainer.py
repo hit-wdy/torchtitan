@@ -312,6 +312,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         ):
             # 调用 model_config.build() 构造出真正的模型对象，例如：DeepSeekV3Model(config=model_config)
             # 进一步调用其父类 Decoder() 构造模型对象（包含 tok_embeddings、rope、layers、norm、output 等子模块）
+            # ! meta 设备上的 Tensor 只有形状、dtype 等元信息，没有真正的参数存储空间。
             model = model_config.build()
 
         # Verify all submodules satisfy the Module protocol
@@ -381,6 +382,20 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         assert self.gradient_accumulation_steps > 0
 
         # apply parallelisms and initialization
+        # 把在 meta 设备上构建的“空壳模型”应用各种并行策略，然后在正确设备上真正分配参数内存并初始化权重。
+        # meta 空壳模型
+        # │
+        # ├── 开启 PP
+        # │     ├── 按层切成流水线 stage
+        # │     ├── 每个 stage 再应用 TP/FSDP/CP/AC/compile
+        # │     ├── 构造流水线调度器
+        # │     ├── 为当前 rank 的 stage 分配真实参数
+        # │     └── 初始化权重
+        # │
+        # └── 未开启 PP
+        #         ├── 对完整模型应用 TP/FSDP/CP/AC/compile
+        #         ├── 分配真实参数
+        #         └── 初始化权重
         with sl.log_trace_span("model_parallelism_init"):
             if parallel_dims.pp_enabled:
                 if not model_spec.pipelining_fn:
@@ -439,11 +454,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                         ac_config=config.activation_checkpoint,
                         dump_folder=config.dump_folder,
                     )
-
+                # 因为在此之前是在meta初始化的，没有数据，所以需要to_empty
                 model.to_empty(device=init_device)
                 with torch.no_grad():
                     # TODO: Change this back to init_weights once
                     # autoparallel contains the wrap_init_states
+                    # cast是类型提示，不是运行时转换.这里只是告诉静态类型检查器：这个对象符合 BaseModel 接口，可以调用 init_weights()。
                     cast(BaseModel, model).init_weights(buffer_device=buffer_device)
                 model.train()
 
@@ -772,6 +788,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     def train_step(
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
+        # 只在整个 train_step() 开头清一次，而不是每个 microbatch 清一次。
         self.optimizers.zero_grad()
         # Save per-optimizer-group learning rates for logging
         lr_metrics = self.lr_schedulers.get_metrics()
@@ -781,19 +798,24 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         parallel_dims = self.parallel_dims
 
         # Collect all microbatches on CPU and count total valid tokens
+        # 根据需要梯度累计的次数收集minibatch构建microbatch
         microbatches = []
         local_valid_tokens = torch.tensor(0, dtype=torch.int64)
         for _microbatch in range(self.gradient_accumulation_steps):
             with sl.log_trace_span("fetching_batch"):
+                # input_dict [B,S]
                 input_dict, labels = next(data_iterator)
+                # 每个 microbatch 的 loss 都需要除以本次参数更新的总有效 token 数,所以先计算当前batch
                 local_valid_tokens += (labels != IGNORE_INDEX).sum()
                 microbatches.append((input_dict, labels))
         sl.log_trace_scalar({"local_valid_tokens": int(local_valid_tokens)})
 
         # All-reduce to get global token count across DP ranks
         # Move to GPU for distributed communication
+        # 计算全局有效 token 数
         if parallel_dims.dp_enabled:
             batch_mesh = parallel_dims.get_mesh("batch")
+            # 在 DP 模式下，每个 rank 只知道自己的 token 数，需要通过 all-reduce 得到全局总数。
             global_valid_tokens = dist_utils.dist_sum(
                 local_valid_tokens.to(self.device), batch_mesh
             )
@@ -809,6 +831,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     input_dict[k] = v.to(self.device)
             labels = labels.to(self.device)
 
+            # ! 执行前向和反向传播
+            # 注意这里每个rank除以总token数。
+            # 假设一个 rank 有 4 个 microbatch，原始 loss 总和分别是：
+            # L1, L2, L3, L4
+            # 每个 microbatch backward 的 loss 是：
+            # L1 / G
+            # L2 / G
+            # L3 / G
+            # L4 / G
+            # 其中：
+            # G = global_valid_tokens
+            # 梯度累积后等价于：
+            # (L1 + L2 + L3 + L4) / G
             loss = self.forward_backward_step(
                 input_dict=input_dict,
                 labels=labels,
@@ -817,6 +852,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             accumulated_losses.append(loss.detach())
 
         with sl.log_trace_span("optim"):
+            # ? 梯度裁剪
+            # 默认 max_norm = 1.0
+            # 它会将所有参数的梯度看成一个大向量，计算整体范数。
+            # 假设：total_grad_norm = 5.0  max_norm = 1.0
+            # 就会按大约：1.0 / 5.0  的比例缩小所有梯度。
             grad_norm = dist_utils.clip_grad_norm_(
                 [p for m in self.model_parts for p in m.parameters()],
                 self.config.training.max_norm,
@@ -824,11 +864,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 pp_mesh=parallel_dims.get_optional_mesh("pp"),
                 ep_enabled=parallel_dims.ep_enabled,
             )
+            # 等待异步 checkpoint staging
             self.checkpointer.maybe_wait_for_staging()
+            # 更新参数
             self.optimizers.step()
+            # 更新学习率
             self.lr_schedulers.step()
 
         # Reduce the data collected over gradient accumulation steps.
+        # 这个 loss 主要用于日志，不再参与 backward。
         loss = torch.sum(torch.stack(accumulated_losses))
 
         # log metrics
@@ -839,7 +883,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
             sl.log_trace_scalar({"global_valid_tokens": int(global_valid_tokens)})
 
-            if parallel_dims.dp_cp_enabled:
+            if parallel_dims.dp_cp_en从vabled:
                 loss = loss.detach()
                 loss_mesh = parallel_dims.get_optional_mesh("loss")
 
@@ -907,6 +951,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             global_step=self.step,
             base_folder=config.dump_folder,
         ) as profiler:
+            # 本轮训练的迭代器，包括input_dict(input_ids、pos)和labels
             data_iterator = self.batch_generator(self.dataloader)
             while self.should_continue_training():
                 self.step += 1

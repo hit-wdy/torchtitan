@@ -87,12 +87,19 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         path, dataset_loader, text_processor = _validate_dataset(
             dataset_name, dataset_path
         )
+        # c4_test 是本地、非流式的 datasets.Dataset。否则返回流式 IterableDataset，避免下载和加载整个数据集
         ds = dataset_loader(path)
 
         self.dataset_name = dataset_name
         # Keep an unshuffled reference so map-style datasets can be re-shuffled
         # deterministically on re-loop and on checkpoint resume.
+        # 按数据并行 rank 分片
+        # 如果对于c4_test(200条数据，则dp_rank0获得0—~499条数据)
         self._original_data = split_dataset_by_node(ds, dp_rank, dp_world_size)
+
+        # _original_data：当前 DP rank 原始、未重新打乱的数据；
+        # _data：当前 epoch 真正读取的数据。
+        # 后续进入新 epoch 时，会从 _original_data 重新打乱
         self._data = self._original_data
         self._tokenizer = tokenizer
         self.seq_len = seq_len
@@ -100,38 +107,59 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         self._text_processor = text_processor
 
         # Variables for checkpointing
-        self._sample_idx = 0
-        self._epoch: int = 0
-        self._inputs_buffer: list[int] = []
-        self._positions_buffer: list[int] = []
+        self._sample_idx = 0  # 表示当前已经处理了多少条原始数据。
+        self._epoch: int = 0  # 主要用于恢复 shuffle 顺序。
+        self._inputs_buffer: list[int] = []      # 保存已经分词、但还没有完全切成训练序列的 token。
+                                                # 如seq_len = 2048
+                                                # 必须积累至少： 2049个 token 才能构造一条训练数据。
+                                                # 如果目前只有 1500 个 token，就暂存在 _inputs_buffer，继续读取下一篇文章。
+        self._positions_buffer: list[int] = []   # 记录每个 token 在所属文章中的位置
 
     def _get_data_iter(self):
         # For map-style datasets, resume by skipping to the correct index
         # For iterable-style datasets, the underlying iterator already points to the correct index
         if isinstance(self._data, Dataset):
+            # 比如c4_testz 是一个本地、非流式的 datasets.Dataset。已经到达末尾
             if self._sample_idx == len(self._data):
                 return iter([])
             else:
                 return iter(self._data.skip(self._sample_idx))
 
         return iter(self._data)
-
     def _normalize_positions(self, positions: list[int]) -> list[int]:
+        """这个方法获取相对位置：一个定长 token 块从某篇长文章中间开始时，第一枚 token 的 position 可能不是 0。
+        """
         offset = positions[0]
         if offset > 0:
             for i, p in enumerate(positions):
+                # position == 0 表示遇到了下一篇文章的开头。
                 if p == 0:
                     break
                 positions[i] = p - offset
         return positions
+    
+        # 【NOTE】position == 0 的两个含义
+        # 在一个训练序列中，0 可能表示：
+        # 1.当前定长训练块的开头；
+        # 2.一个新文档的开头。
+        # 模型可以通过 position 归零识别文档边界，构造 block-causal attention mask
 
     def __iter__(self):
         max_buffer_token_len = 1 + self.seq_len
 
+        # 是否真正循环由：self.infinite决定
         while True:
+            # sample 是一条 Hugging Face 数据，例如：
+            # {
+            #     "text": "Beginners BBQ Class...",
+            #     "timestamp": 1556,
+            #     "url": "https://...",
+            # }
+            # ~ 一个sample是一个文本片段(document)，一个长文章
             for sample in self._get_data_iter():
                 # Use the dataset-specific text processor
                 sample_text = self._text_processor(sample)
+                # !!分词并添加 BOS/EOS,从此便没有任何人类能懂的‘文字’
                 sample_tokens = self._tokenizer.encode(
                     sample_text, add_bos=True, add_eos=True
                 )
@@ -146,6 +174,8 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
                 self._positions_buffer.extend(range(len(sample_tokens)))
                 self._sample_idx += 1
 
+
+                # buffer 足够一条训练数据长时不断切块
                 while len(self._inputs_buffer) >= max_buffer_token_len:
                     x = torch.LongTensor(self._inputs_buffer[:max_buffer_token_len])
                     pos = torch.LongTensor(
@@ -159,6 +189,13 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
                         max_buffer_token_len:
                     ]
 
+                    # 假设：
+                    # x = [BOS, A, B, EOS, BOS, C]
+                    # pos = [0, 1, 2, 3, 0, 1]
+                    # 则：
+                    # input = [BOS, A, B, EOS, BOS]
+                    # label = [A, B, EOS, BOS, C]
+                    # positions = [0, 1, 2, 3, 0]
                     input = x[:-1]
                     label = x[1:]
                     positions = pos[:-1]
@@ -175,6 +212,7 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         """
         self._sample_idx = 0
         self._epoch += 1
+        # 保证不同epoch拿到不同顺序的数据
         if isinstance(self._data, Dataset):
             self._data = cast(
                 Dataset, self._original_data.shuffle(seed=42 + self._epoch)
@@ -277,7 +315,7 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
             "snapshot_every_n_steps": snapshot_every_n_steps,
             "batch_size": local_batch_size,
         }
-
+        # 最终调用StatefulDataLoader，他会把数据组batch
         super().__init__(
             hf_ds,
             dp_rank=dp_rank,

@@ -245,6 +245,9 @@ class Module(nn.Module, Configurable):
         ]
         return self._pos_arg_list
 
+    # 参数可能已经变成 DTensor 或本地 shard；
+    # 模块的 forward 已经被替换成包装后的版本；
+    # 后续每个训练 step 直接调用 model(...) 即可。
     def parallelize(self, parallel_dims: ParallelDims) -> None:
         """Parallelize this module and all Module children recursively.
 
@@ -282,10 +285,14 @@ class Module(nn.Module, Configurable):
 
         if parallel_dims.spmd_backend == "spmd_types":
             spmd_validate_redistributions(self._sharding_config)
-        self._distribute_states(parallel_dims)
-        self._cache_pos_arg_names()
-        fn = self._maybe_wrap_with_local_region(self.forward, parallel_dims)
 
+        # !切分参数和 Buffer
+        self._distribute_states(parallel_dims)
+        # 6. 保存原始 forward 参数名
+        self._cache_pos_arg_names()
+        # 7. 可选地用 local_map 包装原始 forward
+        fn = self._maybe_wrap_with_local_region(self.forward, parallel_dims)
+        # 8. 再包一层输入和输出重新分布
         def forward_with_redistribution(*args, **kwargs):
             args, kwargs = self._redistribute_inputs(parallel_dims, args, kwargs)
             outputs = fn(*args, **kwargs)
@@ -293,6 +300,9 @@ class Module(nn.Module, Configurable):
 
         self.forward = forward_with_redistribution
 
+    # 根据布局把完整 Tensor 切成本地 Tensor；
+    # 将本地 Tensor 重新注册到模块中；
+    # 使用 spmd.assert_type() 给它声明 SPMD 类型。
     def _spmd_distribute_state(
         self,
         parallel_dims: ParallelDims,
@@ -304,14 +314,17 @@ class Module(nn.Module, Configurable):
     ) -> None:
         # Call get_optional_mesh with include_singleton_axes=True, so we're able to call assert_type()
         # using all axes, and defer size-1 axis filtering to spmd_types internals.
+        # 根据布局中出现的逻辑轴取得 DeviceMesh
         mesh = parallel_dims.get_optional_mesh(
             [axis.value for axis in layout.axes()], include_singleton_axes=True
         )
         assert mesh is not None
         assert mesh.mesh_dim_names is not None, "DeviceMesh must have named axes"
 
+        # !真正把全局 Tensor 变成当前进程应当持有的本地部分
         tensor = spmd_distribute_tensor(tensor, mesh, layout)
         if is_param:
+            # 重新注册参数
             self.register_parameter(name, nn.Parameter(tensor))
             registered = self._parameters[name]
         else:
@@ -321,13 +334,33 @@ class Module(nn.Module, Configurable):
 
         # assert_type resolves SpmdLayout's string mesh axis names to concrete
         # runtime mesh-axis objects, so a mesh context is required here.
+        # 给普通本地 Tensor 标注“它在整个分布式系统中的逻辑布局”，如果它已经有布局，则检查新旧布局是否一致。
         with set_current_spmd_mesh(mesh):
+            # 不修改tensor数据只是给其增加_local_type和_partition_spec属性
             spmd.assert_type(
                 registered,
                 layout.axis_types,
                 layout.partition_spec,
             )
 
+    # 读取 sharding_config
+    # │
+    # ├─ 遍历当前模块直接拥有的 Parameter
+    # │   │
+    # │   ├─ 找到该参数的 SpmdLayout
+    # │   ├─ 没有配置 → 报错
+    # │   │
+    # │   ├─ spmd_types 后端
+    # │   │   └─ 切成本地 Tensor，并添加 SPMD 类型
+    # │   │
+    # │   └─ DTensor 后端
+    # │       ├─ 找到对应 DeviceMesh
+    # │       ├─ 将 SpmdLayout 转成 placements
+    # │       ├─ 已经是 DTensor → 检查布局是否一致
+    # │       └─ 普通 Tensor → 转换成 DTensor
+    # │
+    # └─ 遍历当前模块直接拥有的 Buffer
+    #     └─ 执行大体相同的操作
     def _distribute_states(self, parallel_dims: ParallelDims) -> None:
         """Distribute params and buffers per ``state_shardings``.
 
@@ -339,6 +372,7 @@ class Module(nn.Module, Configurable):
         sharding_config = self._sharding_config
         assert sharding_config is not None
 
+        # recurse=False 表示只处理当前模块直接注册的参数，不处理子模块参数。
         for name, param in self.named_parameters(recurse=False):
             spmd_layout = sharding_config.state_shardings.get(name)
             if spmd_layout is None:

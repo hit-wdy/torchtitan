@@ -24,6 +24,21 @@ from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
 from torchtitan.models.deepseek_v3 import DeepSeekV3Model
 
 
+# DeepSeekV3 meta 模型
+# │
+# ├── CP 包装（如果开启）
+# ├── TP：切分 attention、embedding、lm_head
+# ├── EP：切分 MoE routed experts
+# ├── Activation Checkpointing
+# ├── torch.compile（如果配置）
+# └── FSDP：进一步切分参数并安装 all-gather/reduce-scatter hook
+# 主要完成的是：
+# 确定参数属于哪个 mesh；
+# 确定每个参数怎样切分；
+# 将参数变成 DTensor/FSDP 管理的形式；
+# 安装 forward 前后的通信逻辑；
+# 还没有为所有参数真正分配存储。
+
 def parallelize_deepseekv3(
     model: DeepSeekV3Model,
     *,
@@ -35,6 +50,7 @@ def parallelize_deepseekv3(
     dump_folder: str,
 ):
     if parallelism.spmd_backend in ("full_dtensor", "spmd_types"):
+        # 验证开启CP的情况下attn是不是FlexAttention,否则报错
         validate_config(parallel_dims, model)
         model.parallelize(parallel_dims)
     else:
@@ -55,6 +71,11 @@ def parallelize_deepseekv3(
     model_compile_enabled = (
         compile_config.enable and "model" in compile_config.components
     )
+
+    # 先 compile 原始 block 再 AC ，编译器可能无法正确感知：
+    # - 哪部分 forward 需要保存；
+    # - 哪部分反向时需要重算；
+    # - AC wrapper 和 compiled graph 的边界。
 
     if ac_config is not None:
         ac_config.build(dump_folder=dump_folder).apply(model)

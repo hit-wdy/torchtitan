@@ -34,9 +34,15 @@ class ConfigManager:
     def parse_args(self, args: list[str] | None = None):
         if args is None:
             args = sys.argv[1:]
+
+        # args 是过滤--module 和 --conf之后剩余的命令行参数
         loaded_config, args = self._load_config(args)
         config_cls = type(loaded_config)
 
+        # 把 loaded_config 当作默认配置模板，根据 config_cls 的类型注解解析 args 中的命令行参数，
+        # 用命令行值覆盖默认值，最后返回一个完整的配置对象并赋给 self.config。
+        # note: registry 是自定义类型解析规则集合。tyro 原生知道怎么解析：int,float,str,bool
+        # 但 TorchTitan 有一些特殊格式，需要告诉 tyro 应该怎么解析。
         self.config = tyro.cli(
             config_cls, args=args, default=loaded_config, registry=custom_registry
         )
@@ -230,6 +236,7 @@ class ConfigManager:
 
     @staticmethod
     def register_tyro_rules(registry: tyro.constructors.ConstructorRegistry) -> None:
+        # 注册自定义规则一：逗号分隔的 list[str]
         @registry.primitive_rule
         def list_str_rule(type_info: tyro.constructors.PrimitiveTypeInfo):
             """Support for comma separated string parsing"""
@@ -243,6 +250,7 @@ class ConfigManager:
                 str_from_instance=lambda instance: [",".join(instance)],
             )
 
+        # 规则二：override.imports
         @registry.primitive_rule
         def override_imports_rule(type_info: tyro.constructors.PrimitiveTypeInfo):
             """Parse ``--override.imports`` targets, each with optional kwargs.

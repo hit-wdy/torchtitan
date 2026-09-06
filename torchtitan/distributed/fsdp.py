@@ -101,6 +101,10 @@ def apply_fsdp_to_decoder(
     ``moe_enabled`` blocks, so every transformer block is sharded as a single
     FSDP unit and the expert-parallel prefetching below is skipped.
 
+    把 Decoder 模型按“Embedding / 每个 Transformer Block / Norm+LM Head”划分成多个
+    FSDP2 单元，并针对 MoE routed expert 使用独立的 FSDP mesh 和切分维度，最后配置
+    混合精度、参数 reshard、通信预取及梯度缩放。
+
     Args:
         model (Decoder): The model to apply data parallelism to.
         dp_mesh (DeviceMesh): The device mesh to use for data parallelism.
@@ -133,6 +137,9 @@ def apply_fsdp_to_decoder(
         enable_symm_mem (bool): Whether to enable symmetric-memory FSDP
             communication.
     """
+    # param_dtype： 完整参数和参数 AllGather 使用的 dtype
+    # reduce_dtype：梯度 ReduceScatter 使用的 dtype
+    # cast_forward_inputs=False： 不让 FSDP 自动转换输入激活 dtype
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,

@@ -366,6 +366,10 @@ def spmd_redistribute_per_axis(
     return x
 
 
+# 这里的切分不是通过 scatter 把参数从一张卡发送到其他卡，而是：
+# 每个 rank 一开始都持有完整且相同的 Tensor，然后根据自己在 mesh 
+# 轴中的局部 rank，直接在本地取出对应的 torch.chunk。
+
 def spmd_distribute_tensor(
     tensor: torch.Tensor,
     mesh: DeviceMesh,
@@ -379,12 +383,22 @@ def spmd_distribute_tensor(
     slice by CP.
     """
     shard_types = layout.per_axis_spmd_types()
+    # 根据 Layout 是否含有 PartitionSpec，走两种解析方式。
+    # 情况一：直接使用 S(dim), 例如：
+    # SpmdLayout({
+    #     DP: spmd.I,
+    #     TP: spmd.S(1),
+    # })
+    # 会生成：
+    # axis_shard_dims = [ (TP, 1) ]
     if layout.partition_spec is None:
         axis_shard_dims = [
             (axis_name, axis_type.dim)
             for axis_name, axis_type in shard_types.items()
             if isinstance(axis_type, spmd.Shard)
         ]
+    # 使用 PartitionSpec 的情况,PartitionSpec 是按照 Tensor 维度描述布局的。
+    # 如 PartitionSpec(DP, None, TP) 得到： axis_shard_dims = [  (DP, 0),  (TP, 2), ]
     else:
         # When multiple mesh axes shard the same tensor dim, the raw
         # PartitionSpec tuple defines the slicing order. For example,
@@ -394,6 +408,7 @@ def spmd_distribute_tensor(
             if entry is None:
                 continue
             axes = entry if isinstance(entry, tuple) else (entry,)
+            # 多个轴切同一个维度时，保证顺序
             for axis_name in axes:
                 axis_shard_dims.append((axis_name, dim))
 
@@ -406,10 +421,12 @@ def spmd_distribute_tensor(
             else 1
         )
         if axis_size > 1:
+            # 真正执行切分,其本质是沿指定 Tensor 维度切成 N 份,根据当前 rank 取其中一份
             tensor = spmd.shard(
                 tensor,
                 mesh.get_group(axis),
                 src=spmd.I,
                 dst=spmd.S(dim),
             )
+    # 结果只是普通本地 Tensor：shape 已经是 local shape，对象自身不携带 DTensor 元数据
     return tensor

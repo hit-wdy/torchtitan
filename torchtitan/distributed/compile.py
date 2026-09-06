@@ -39,17 +39,35 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig) -> None:
     """
     # Needed for torch.compile to handle data-dependent dynamic shapes in
     # token-choice MoE dispatch. Harmless for dense models.
+    # 开启该选项可以让 Dynamo 尽量把标量输出保留在编译图中，而不是立刻 graph break。
     torch._dynamo.config.capture_scalar_outputs = True
     # Skip replaying forward side effects (e.g. RoPE cache updates) during
     # the AC recompute in backward. Eager AC replays the forward python
     # side-effects in backward, but torch.compile has no easy way to reapply
     # python mutations in the backward. Setting this flag accepts this eager
     # and compile divergence by skipping reapplication of side effects.
+    # 用于协调：
+    # - torch.compile；
+    # - Activation Checkpointing；
+    # - RoPE cache 等 forward 副作用。
+    # AC 反向时会重算 forward，但编译模式不方便重新执行 Python 层副作用，所以这里要求跳过这些副作用的重复应用。
     torch._dynamo.config.skip_fwd_side_effects_in_bwd_under_checkpoint = (
         True  # pyrefly: ignore [bad-assignment]
     )
 
     backend = _maybe_regional_inductor_backend(model, compile_config.backend)
+
+    # 为什么按 TransformerBlock 编译
+    # TransformerBlock 是自然的重复计算单元。
+    # 相比整个模型一起编译：
+    # - 图的规模更可控；
+    # - 编译时间更合理；
+    # - 不容易被跨层 Python 控制流打断；
+    # - 各层结构类似，更容易复用缓存；
+    # - 更容易和 Activation Checkpointing、FSDP 组合。
+    # 
+    # 并且fullgraph=True 要求每个 TransformerBlock 尽量形成一个完整 FX graph。
+    # 如果中间遇到无法捕获的 Python 操作，不希望悄悄 graph break 成多个小图，而是尽早暴露问题。
 
     # pyrefly: ignore [missing-attribute]
     for layer_id, transformer_block in model.layers.named_children():

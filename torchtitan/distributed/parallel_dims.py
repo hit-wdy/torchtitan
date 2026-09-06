@@ -241,6 +241,7 @@ class ParallelDims:
         group and wait for DeviceMesh to fix the issue.
         """
 
+        # 把几种mesh合并为一个需要的mesh
         def unflatten_mesh(
             world_mesh: DeviceMesh,
             dim_names: tuple[str, ...],
